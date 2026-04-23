@@ -2,26 +2,31 @@
 pragma solidity ^0.8.24;
 
 /// @notice Minimal canonical paymaster for EIP-8141-style frame transactions.
-/// @dev The contract has two VERIFY-frame code paths, selected by the calldata
-///      length (65 bytes = paymaster mode, 97 bytes = guarantor mode), and one
-///      DEFAULT-frame entrypoint for the guarantor-mode nonce bump.
+/// @dev The contract has two VERIFY-frame code paths, selected by the current
+///      frame's `allowed_scope` (APPROVE_PAYMENT = paymaster mode, APPROVE_GUARANTEE
+///      = guarantor mode), and one DEFAULT-frame entrypoint for the guarantor-mode
+///      nonce bump. In both modes, the VERIFY frame's calldata is exactly
+///      `r (32) || s (32) || v (1)` (65 bytes).
 ///
-///      **Paymaster mode** (65-byte calldata: `r (32) || s (32) || v (1)`):
-///      the signature is checked against TXPARAM(0x08), i.e. the canonical tx
-///      sig hash. On success, the contract calls APPROVE(APPROVE_PAYMENT).
+///      **Paymaster mode** (`allowed_scope == APPROVE_PAYMENT`): the signature is
+///      checked against TXPARAM(0x08), i.e. the canonical tx sig hash. On success,
+///      the contract calls APPROVE(APPROVE_PAYMENT). Replay protection comes from
+///      the sender's nonce, which is incremented by the protocol when
+///      `sender_approved` is set.
 ///
-///      **Guarantor mode** (97-byte calldata: `r (32) || s (32) || v (1) ||
-///      payer_nonce (32)`): the frame introspects the bump_nonce frame at
-///      `current + 2` (skipping the sender validation frame at `current + 1`)
-///      to confirm it is a DEFAULT call to `bumpNonce(tx.sender, payer_nonce)`
-///      with `gas_limit` sufficient for a cold-slot SSTORE, verifies
-///      `guarantor_nonce[tx.sender] == payer_nonce`, and authenticates the
-///      signer over `keccak256(TXPARAM(0x09) || payer_nonce)`. TXPARAM(0x09)
-///      is the frame-elide sig hash which elides only the current frame's
-///      data, preserving the sender's VERIFY data and preventing an attacker
-///      from mutating the sender's signature to grief the guarantor. On
-///      success, it calls APPROVE(APPROVE_GUARANTEE), which alone satisfies
-///      the transaction validity condition without requiring `sender_approved`.
+///      **Guarantor mode** (`allowed_scope == APPROVE_GUARANTEE`): the frame
+///      introspects the bump_nonce frame at `current + 2` (skipping the sender
+///      validation frame at `current + 1`) to confirm it is a DEFAULT call to
+///      `bumpNonce(tx.sender, payer_nonce)` with `gas_limit` sufficient for a
+///      cold-slot SSTORE. It reads `payer_nonce` from the bump_nonce frame's
+///      data (no separate copy is needed in calldata), verifies
+///      `guarantor_nonce[tx.sender] == payer_nonce`, and authenticates the signer
+///      over TXPARAM(0x09) (the frame-elide sig hash). TXPARAM(0x09) binds both
+///      the sender's VERIFY data (preventing sig-mutation grief) and the
+///      bump_nonce frame's `payer_nonce` (via its DEFAULT-frame `data`), so no
+///      extra commitment to `payer_nonce` is required in the signed message. On
+///      success, it calls APPROVE(APPROVE_GUARANTEE), which alone satisfies the
+///      transaction validity condition without requiring `sender_approved`.
 ///
 ///      **bumpNonce**: called by the DEFAULT frame that follows the sender
 ///      validation frame (at `current + 2` from the guarantee). It checks
@@ -103,12 +108,19 @@ contract CanonicalPaymaster {
 
     /// @dev Raw paymaster validation entrypoint. Use as the target of the
     ///      `pay`/`guarantee` VERIFY frame. The code path is selected by the
-    ///      calldata length: 65 bytes = paymaster mode, 97 bytes = guarantor mode.
+    ///      current frame's `allowed_scope`:
+    ///      APPROVE_PAYMENT   => paymaster mode,
+    ///      APPROVE_GUARANTEE => guarantor mode.
     fallback() external payable {
-        if (msg.data.length == 65) {
+        if (msg.data.length != 65) revert InvalidSignature();
+
+        uint256 currentFrame = _currentFrameIndex();
+        uint256 allowedScope = _frameAllowedScope(currentFrame);
+
+        if (allowedScope == APPROVE_PAYMENT) {
             _handlePaymasterMode();
-        } else if (msg.data.length == 97) {
-            _handleGuarantorMode(_currentFrameIndex());
+        } else if (allowedScope == APPROVE_GUARANTEE) {
+            _handleGuarantorMode(currentFrame);
         } else {
             revert InvalidSignature();
         }
@@ -136,18 +148,16 @@ contract CanonicalPaymaster {
     }
 
     function _handleGuarantorMode(uint256 currentFrame) internal {
-        // Calldata: r (32) || s (32) || v (1) || payer_nonce (32) = 97 bytes
+        // Calldata: r (32) || s (32) || v (1) = 65 bytes
         // (length already checked in fallback)
         bytes32 r;
         bytes32 s;
         uint8 v;
-        uint256 payerNonce;
 
         assembly {
             r := calldataload(0x00)
             s := calldataload(0x20)
             v := byte(0, calldataload(0x40))
-            payerNonce := calldataload(0x41)
         }
 
         if (uint256(s) > SECP256K1N_DIV_2) revert InvalidSignature();
@@ -156,10 +166,10 @@ contract CanonicalPaymaster {
         // 1. Introspect the bump_nonce frame at current + 2 (skipping the
         //    sender validation frame at current + 1). It MUST be a DEFAULT
         //    call back to this contract invoking bumpNonce(tx.sender,
-        //    payer_nonce) with enough gas for a cold-slot SSTORE. The sig
-        //    hash covers this frame's target, mode, gas_limit, and data
-        //    (DEFAULT data is not elided), so these checks bind the
-        //    bump_nonce frame's exact shape to the guarantor's signature.
+        //    payer_nonce) with enough gas for a cold-slot SSTORE. DEFAULT
+        //    frame data is not elided from TXPARAM(0x09), so these checks
+        //    bind the bump_nonce frame's exact shape — including payer_nonce
+        //    — to the guarantor's signature.
         uint256 nextFrame;
         unchecked {
             nextFrame = currentFrame + 2;
@@ -182,22 +192,19 @@ contract CanonicalPaymaster {
         if (address(uint160(uint256(_frameDataLoad(nextFrame, 4)))) != txSender) {
             revert InvalidBumpNonceFrame();
         }
-        if (uint256(_frameDataLoad(nextFrame, 36)) != payerNonce) {
-            revert InvalidBumpNonceFrame();
-        }
+        uint256 payerNonce = uint256(_frameDataLoad(nextFrame, 36));
 
         // 2. Nonce match. The bump itself happens in the following DEFAULT
         //    frame; this check ensures the bump will not spuriously revert.
         if (guarantor_nonce[txSender] != payerNonce) revert InvalidNonce();
 
-        // 3. Authenticate the signer over keccak256(frame_sig_hash || payer_nonce).
-        //    frame_sig_hash = TXPARAM(0x09) elides only the current frame's data,
-        //    preserving the sender's VERIFY frame data. This prevents an attacker
-        //    from mutating the sender's signature to grief the guarantor.
-        //    payer_nonce is appended because it lives in the guarantor's own
-        //    VERIFY frame data, which IS elided from frame_sig_hash.
-        bytes32 guarantorSigHash = keccak256(abi.encodePacked(_txFrameSigHash(), payerNonce));
-        if (ecrecover(guarantorSigHash, v, r, s) != owner) revert InvalidSignature();
+        // 3. Authenticate the signer over TXPARAM(0x09), the frame-elide sig
+        //    hash. It elides only the current frame's data and preserves
+        //    every other frame's data — including the sender's VERIFY data
+        //    (preventing sig-mutation grief) and the bump_nonce frame's data
+        //    (which carries payer_nonce). So payer_nonce is already bound by
+        //    this hash via the bump_nonce frame; no extra commitment needed.
+        if (ecrecover(_txFrameSigHash(), v, r, s) != owner) revert InvalidSignature();
 
         // 4. Approve as guarantor. This sets guarantor_approved = true, which
         //    alone satisfies the transaction validity condition without
@@ -354,6 +361,13 @@ contract CanonicalPaymaster {
         assembly {
             // FRAMEPARAM(0x04, idx) -> len(frame.data)
             len := verbatim_1i_1o(hex"6004b3", idx)
+        }
+    }
+
+    function _frameAllowedScope(uint256 idx) internal returns (uint256 s) {
+        assembly {
+            // FRAMEPARAM(0x06, idx) -> frame.flags & APPROVE_SCOPE_MASK
+            s := verbatim_1i_1o(hex"6006b3", idx)
         }
     }
 
